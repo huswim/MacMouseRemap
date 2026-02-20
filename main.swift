@@ -2,40 +2,332 @@
 // MouseRemap — Remap mouse side buttons (Back/Forward) to ⌘+[ and ⌘+]
 //
 // Build:  swiftc main.swift -o MouseRemap
-// Run:    ./MouseRemap          (silent mode, default)
-//         ./MouseRemap -v       (verbose — log button presses to stderr)
+//
+// Usage:
+//   ./MouseRemap              Run the remapper (foreground)
+//   ./MouseRemap -v           Run with verbose logging
+//   ./MouseRemap --install    Install as a background service (launchd)
+//   ./MouseRemap --uninstall  Remove the background service
+//   ./MouseRemap --help       Show usage information
 //
 // Requires Accessibility permission:
 //   System Settings → Privacy & Security → Accessibility
-//   Add the compiled binary (or Terminal.app if running from terminal).
 
 import Foundation
 import CoreGraphics
 import ApplicationServices  // AXIsProcessTrusted()
 
-// MARK: - Configuration
+// MARK: - Constants
 
 /// Virtual key codes (US ANSI keyboard layout).
 let kKeyCodeLeftBracket:  CGKeyCode = 33   // '['
 let kKeyCodeRightBracket: CGKeyCode = 30   // ']'
 
-// FIX: [LOW] Unconditional logging — gate behind a --verbose / -v flag.
-// Logging every button press leaks input-timing metadata when stderr is
-// redirected or captured (e.g. by launchd, piped to another process).
+/// launchd service configuration.
+let kServiceLabel = "com.user.mouseremap"
+let kInstallPath  = "/usr/local/bin/MouseRemap"
+let kPlistPath    = (NSString("~/Library/LaunchAgents/com.user.mouseremap.plist")
+                        .expandingTildeInPath)
+
+// MARK: - CLI Argument Parsing
+
 let gVerbose: Bool = CommandLine.arguments.contains("-v")
                    || CommandLine.arguments.contains("--verbose")
 
-// FIX: [MEDIUM] Changed from CFMachPort! (implicitly unwrapped optional) to
-// CFMachPort? (regular optional).  The IUO was unsafe because it
-// communicates "always non-nil" while actually being nil at startup.
-// All access paths already use `if let` / `guard let`, so this is a safe
-// tightening of the type contract.
+// MARK: - Install / Uninstall / Help Handlers
+
+// FIX: [MEDIUM] Log paths moved from /tmp to ~/Library/Logs/.
+// /tmp is world-writable — an attacker could place a symlink at
+// /tmp/mouseremap.err.log pointing to a sensitive file (e.g. ~/.zshrc),
+// causing the launchd service to overwrite it on startup.
+// ~/Library/Logs/ is user-owned and not world-writable.
+let kLogDir = (NSString("~/Library/Logs").expandingTildeInPath)
+let kStdoutLog = "\(kLogDir)/mouseremap.out.log"
+let kStderrLog = "\(kLogDir)/mouseremap.err.log"
+
+/// Generate the LaunchAgent plist XML content.
+func launchAgentPlist() -> String {
+    return """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>\(kServiceLabel)</string>
+
+        <key>ProgramArguments</key>
+        <array>
+            <string>\(kInstallPath)</string>
+        </array>
+
+        <key>RunAtLoad</key>
+        <true/>
+
+        <key>KeepAlive</key>
+        <true/>
+
+        <key>StandardErrorPath</key>
+        <string>\(kStderrLog)</string>
+
+        <key>StandardOutPath</key>
+        <string>\(kStdoutLog)</string>
+    </dict>
+    </plist>
+    """
+}
+
+// FIX: [HIGH] Removed shell() function that used string interpolation to
+// build shell commands. Passing user-controlled strings (e.g. binaryPath
+// from argv[0]) through "/bin/sh -c" creates a command injection vector:
+// a malicious binary path containing shell metacharacters (;, |, $(), etc.)
+// could execute arbitrary commands, especially dangerous under sudo.
+// Replaced with runProcess() that calls executables directly with argument
+// arrays, completely bypassing shell interpretation.
+
+/// Run a process directly (no shell). Returns (exitCode, stdout+stderr).
+@discardableResult
+func runProcess(_ executable: String, _ arguments: [String] = []) -> (Int32, String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError  = pipe
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return (1, "Failed to run \(executable): \(error.localizedDescription)")
+    }
+
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    return (process.terminationStatus, output)
+}
+
+/// Resolve the path of the currently running binary to an absolute path.
+func currentBinaryPath() -> String {
+    let arg0 = CommandLine.arguments[0]
+
+    // If arg0 is already absolute, use it directly.
+    if arg0.hasPrefix("/") {
+        return arg0
+    }
+
+    // Otherwise, resolve relative to the current working directory.
+    let cwd = FileManager.default.currentDirectoryPath
+    let resolved = (cwd as NSString).appendingPathComponent(arg0)
+    return (resolved as NSString).standardizingPath
+}
+
+/// Install MouseRemap as a launchd background service.
+func performInstall() {
+    print("📦 Installing MouseRemap as a background service...\n")
+
+    let binaryPath = currentBinaryPath()
+    let fm = FileManager.default
+
+    // Verify source binary actually exists
+    guard fm.fileExists(atPath: binaryPath) else {
+        fputs("❌ Source binary not found at: \(binaryPath)\n", stderr)
+        exit(1)
+    }
+
+    // Step 1: Copy binary to /usr/local/bin
+    print("1️⃣  Copying binary to \(kInstallPath)...")
+
+    // Ensure /usr/local/bin exists (use FileManager, not shell)
+    let installDir = (kInstallPath as NSString).deletingLastPathComponent
+    if !fm.fileExists(atPath: installDir) {
+        do {
+            try fm.createDirectory(atPath: installDir, withIntermediateDirectories: true)
+        } catch {
+            fputs("❌ Failed to create \(installDir): \(error.localizedDescription)\n", stderr)
+            fputs("\n💡 Try running with sudo:\n   sudo ./MouseRemap --install\n", stderr)
+            exit(1)
+        }
+    }
+
+    // Copy binary (use FileManager, not shell cp)
+    do {
+        if fm.fileExists(atPath: kInstallPath) {
+            try fm.removeItem(atPath: kInstallPath)
+        }
+        try fm.copyItem(atPath: binaryPath, toPath: kInstallPath)
+    } catch {
+        fputs("❌ Failed to copy binary: \(error.localizedDescription)\n", stderr)
+        fputs("\n💡 Try running with sudo:\n   sudo ./MouseRemap --install\n", stderr)
+        exit(1)
+    }
+
+    // Set executable permission (use chmod directly, no shell)
+    let (chmodCode, chmodOut) = runProcess("/bin/chmod", ["+x", kInstallPath])
+    if chmodCode != 0 {
+        fputs("⚠️  chmod +x failed: \(chmodOut)", stderr)
+    }
+    print("   ✅ Binary installed at \(kInstallPath)")
+
+    // Step 2: Ensure log directory exists
+    if !fm.fileExists(atPath: kLogDir) {
+        do {
+            try fm.createDirectory(atPath: kLogDir, withIntermediateDirectories: true)
+        } catch {
+            fputs("⚠️  Could not create log directory \(kLogDir): \(error.localizedDescription)\n", stderr)
+        }
+    }
+
+    // Step 3: Create LaunchAgent plist
+    print("2️⃣  Creating LaunchAgent plist...")
+
+    let plistDir = (kPlistPath as NSString).deletingLastPathComponent
+    if !fm.fileExists(atPath: plistDir) {
+        do {
+            try fm.createDirectory(atPath: plistDir, withIntermediateDirectories: true)
+        } catch {
+            fputs("❌ Failed to create \(plistDir): \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+
+    do {
+        try launchAgentPlist().write(toFile: kPlistPath, atomically: true, encoding: .utf8)
+    } catch {
+        fputs("❌ Failed to write plist: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+    print("   ✅ Plist created at \(kPlistPath)")
+
+    // Step 4: Unload if already loaded (ignore errors), then load
+    print("3️⃣  Loading service via launchctl...")
+    runProcess("/bin/launchctl", ["unload", kPlistPath])
+
+    let (loadCode, loadOut) = runProcess("/bin/launchctl", ["load", kPlistPath])
+    if loadCode != 0 {
+        fputs("⚠️  launchctl load returned an error:\n\(loadOut)", stderr)
+        fputs("   The plist was still created — you can load it manually:\n", stderr)
+        fputs("   launchctl load \"\(kPlistPath)\"\n", stderr)
+    } else {
+        print("   ✅ Service loaded and running")
+    }
+
+    print("""
+
+    ✅ Installation complete!
+
+    ⚠️  Don't forget to grant Accessibility permission:
+       System Settings → Privacy & Security → Accessibility
+       Add: \(kInstallPath)
+
+    Useful commands:
+       Check status:  launchctl list | grep mouseremap
+       View logs:     cat \(kStdoutLog)
+                      cat \(kStderrLog)
+       Uninstall:     ./MouseRemap --uninstall
+    """)
+    exit(0)
+}
+
+/// Uninstall MouseRemap background service.
+func performUninstall() {
+    print("🗑  Uninstalling MouseRemap background service...\n")
+
+    let fm = FileManager.default
+
+    // Step 1: Unload the service (use direct args, no shell)
+    print("1️⃣  Unloading service via launchctl...")
+    if fm.fileExists(atPath: kPlistPath) {
+        let (code, out) = runProcess("/bin/launchctl", ["unload", kPlistPath])
+        if code != 0 {
+            fputs("⚠️  launchctl unload: \(out)", stderr)
+        } else {
+            print("   ✅ Service unloaded")
+        }
+    } else {
+        print("   ⏭  Plist not found, skipping launchctl unload")
+    }
+
+    // Step 2: Remove plist (use FileManager, no shell)
+    print("2️⃣  Removing plist...")
+    if fm.fileExists(atPath: kPlistPath) {
+        do {
+            try fm.removeItem(atPath: kPlistPath)
+            print("   ✅ Removed \(kPlistPath)")
+        } catch {
+            fputs("❌ Failed to remove plist: \(error.localizedDescription)\n", stderr)
+        }
+    } else {
+        print("   ⏭  Plist not found, skipping")
+    }
+
+    // Step 3: Remove binary (use FileManager, no shell)
+    print("3️⃣  Removing binary...")
+    if fm.fileExists(atPath: kInstallPath) {
+        do {
+            try fm.removeItem(atPath: kInstallPath)
+            print("   ✅ Removed \(kInstallPath)")
+        } catch {
+            fputs("❌ Failed to remove binary: \(error.localizedDescription)\n", stderr)
+            fputs("💡 Try: sudo ./MouseRemap --uninstall\n", stderr)
+        }
+    } else {
+        print("   ⏭  Binary not found at \(kInstallPath), skipping")
+    }
+
+    print("\n✅ Uninstall complete.")
+    exit(0)
+}
+
+/// Print usage information.
+func printHelp() {
+    print("""
+    MouseRemap — Remap mouse side buttons to ⌘+[ / ⌘+]
+
+    USAGE:
+      MouseRemap [OPTIONS]
+
+    OPTIONS:
+      (none)          Run the remapper in the foreground
+      -v, --verbose   Enable verbose logging to stderr
+      --install       Install as a launchd background service
+      --uninstall     Remove the launchd background service
+      --help          Show this help message
+
+    BACKGROUND SERVICE:
+      --install copies the binary to \(kInstallPath),
+      creates a LaunchAgent plist, and loads it via launchctl.
+      The service will start automatically on login.
+
+      --uninstall reverses all of the above.
+
+    ACCESSIBILITY:
+      This tool requires Accessibility permission.
+      System Settings → Privacy & Security → Accessibility
+    """)
+    exit(0)
+}
+
+// MARK: - Handle CLI subcommands (before any event-tap work)
+
+if CommandLine.arguments.contains("--help") {
+    printHelp()
+}
+
+if CommandLine.arguments.contains("--install") {
+    performInstall()
+}
+
+if CommandLine.arguments.contains("--uninstall") {
+    performUninstall()
+}
+
+// MARK: - Event Tap Mode (default)
+
 var gEventTap: CFMachPort?
 
-// MARK: - Step 1: Check Accessibility permission
-
-// CGEventTap requires the calling process to be trusted for Accessibility.
-// Without this, the tap will either fail to create or silently never fire.
+// Check Accessibility permission.
 guard AXIsProcessTrusted() else {
     fputs("""
     ⚠️  Accessibility permission is required.
@@ -56,15 +348,8 @@ guard AXIsProcessTrusted() else {
     exit(1)
 }
 
-// MARK: - Step 2: Define the event-tap callback
+// MARK: - Event-tap callback
 
-/// C-convention callback invoked for every matching HID event.
-///
-/// - Mouse button 4 (buttonNumber 3) → suppress + post ⌘+[
-/// - Mouse button 5 (buttonNumber 4) → suppress + post ⌘+]
-/// - All other events pass through unmodified.
-/// - On `.tapDisabledByTimeout`, re-enable the tap automatically.
-/// - On `.tapDisabledByUserInput` (Secure Input), do NOT re-enable.
 func eventTapCallback(
     proxy: CGEventTapProxy,
     type: CGEventType,
@@ -75,12 +360,6 @@ func eventTapCallback(
     // ── Tap disabled by the system ──────────────────────────────────────
 
     // FIX: [HIGH] tapDisabledByUserInput — do NOT re-enable.
-    // macOS sends .tapDisabledByUserInput when Secure Input Mode is active
-    // (password fields, sudo prompts, 1Password, etc.).  This is an
-    // intentional OS security boundary.  Re-enabling would attempt to
-    // bypass Secure Input, potentially intercepting/injecting keystrokes
-    // during credential entry.  Only re-enable on .tapDisabledByTimeout,
-    // which is a benign "your callback was too slow" signal.
     if type == .tapDisabledByUserInput {
         if gVerbose {
             fputs("🔒 Tap disabled by Secure Input — respecting OS boundary.\n", stderr)
@@ -103,69 +382,48 @@ func eventTapCallback(
         return Unmanaged.passRetained(event)
     }
 
-    // Button numbering:  0 = Left, 1 = Right, 2 = Middle, 3 = Button4, 4 = Button5
     let buttonNumber = event.getIntegerValueField(.mouseEventButtonNumber)
 
     let keyCode: CGKeyCode
     switch buttonNumber {
-    case 3:   // Mouse button 4 (typically "Back")
+    case 3:   // Mouse button 4 (Back)
         keyCode = kKeyCodeLeftBracket    // ⌘+[
-    case 4:   // Mouse button 5 (typically "Forward")
+    case 4:   // Mouse button 5 (Forward)
         keyCode = kKeyCodeRightBracket   // ⌘+]
     default:
-        // Not a side button (e.g. middle click) — pass through.
         return Unmanaged.passRetained(event)
     }
 
-    // key-down when the mouse button is pressed, key-up when released.
     let keyDown = (type == .otherMouseDown)
 
     // ── Synthesize keyboard event ───────────────────────────────────────
 
-    // FIX: [MEDIUM] CGEventSource: nil → .combinedSessionState.
-    // A nil source produces events with no source identification. Security-
-    // sensitive apps inspect the source state and may flag/drop nil-source
-    // events as untrusted. Using .combinedSessionState stamps the event
-    // with the real hardware+software keyboard state, making it
-    // indistinguishable from genuine hardware input at the API level.
+    // FIX: [MEDIUM] Use .combinedSessionState instead of nil source.
     let eventSource = CGEventSource(stateID: .combinedSessionState)
 
     guard let keyEvent = CGEvent(keyboardEventSource: eventSource,
                                   virtualKey: keyCode,
                                   keyDown: keyDown) else {
         fputs("⚠️  Failed to create synthetic keyboard event.\n", stderr)
-        // Can't synthesize — let the original event through as a fallback.
         return Unmanaged.passRetained(event)
     }
 
-    // FIX: [MEDIUM] Flag overwrite — preserve real hardware modifiers.
-    // The original code did `keyEvent.flags = .maskCommand`, which
-    // discarded any modifiers the user was physically holding (Shift,
-    // Option, Control).  This (a) breaks modifier combos like ⌘+Shift+[
-    // and (b) creates a mismatch between the event's flags and the real
-    // hardware state that apps can detect as synthetic.
-    // We read the current hardware modifier state and union it with ⌘.
+    // FIX: [MEDIUM] Preserve real hardware modifiers, union with ⌘.
     let currentFlags = CGEventSource.flagsState(.combinedSessionState)
     keyEvent.flags = currentFlags.union(.maskCommand)
 
-    // Post at the HID layer so the event appears as a real keypress.
     keyEvent.post(tap: .cghidEventTap)
 
-    // FIX: [LOW] Logging gated behind gVerbose flag.
     if gVerbose && keyDown {
         let symbol = (buttonNumber == 3) ? "⌘+[" : "⌘+]"
         fputs("🖱  Button \(buttonNumber + 1) → \(symbol)\n", stderr)
     }
 
-    // Return nil to suppress the original mouse side-button event.
     return nil
 }
 
-// MARK: - Step 3: Create the event tap
+// MARK: - Create the event tap
 
-// We intercept at .cghidEventTap (lowest level, before any app sees the event)
-// with .headInsertEventTap (our callback runs first).
-// .defaultTap means we can both observe AND modify/suppress events.
 let eventMask: CGEventMask =
     (1 << CGEventType.otherMouseDown.rawValue) |
     (1 << CGEventType.otherMouseUp.rawValue)
@@ -190,41 +448,27 @@ guard let eventTap = CGEvent.tapCreate(
     exit(1)
 }
 
-// Store the tap globally so the callback can re-enable it on timeout.
 gEventTap = eventTap
 
-// MARK: - Step 4: Add the tap to the current run loop
-
-// FIX: [LOW] Added nil check for runLoopSource.
-// CFMachPortCreateRunLoopSource can return nil on allocation failure or
-// if the mach port is invalid.  Passing nil to CFRunLoopAddSource would
-// be a null-pointer dereference in CoreFoundation.
+// Add to run loop.
 guard let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0) else {
     fputs("❌ Failed to create run loop source from event tap.\n", stderr)
     exit(1)
 }
 
 CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-
-// Explicitly enable the tap (it defaults to enabled, but be safe).
 CGEvent.tapEnable(tap: eventTap, enable: true)
 
-// MARK: - Step 5: Graceful shutdown
+// MARK: - Graceful shutdown
 
-// FIX: [LOW] Install signal handlers for SIGINT (Ctrl+C) and SIGTERM.
-// Without these, the event tap is not explicitly disabled on exit. While
-// macOS kernel cleanup will reclaim the resources, explicit teardown
-// prevents a brief window where a "dead" tap reference lingers in the
-// HID server, and ensures clean shutdown in process-managed environments
-// (launchd, supervisord, etc.).
 func installSignalHandlers() {
-    let handler: @convention(c) (Int32) -> Void = { signal in
+    let handler: @convention(c) (Int32) -> Void = { sig in
         if let tap = gEventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
         }
-        fputs("\n🛑 MouseRemap stopped (signal \(signal)).\n", stderr)
-        _Exit(0)  // _Exit avoids atexit handlers that could deadlock
+        fputs("\n🛑 MouseRemap stopped (signal \(sig)).\n", stderr)
+        _Exit(0)
     }
 
     signal(SIGINT,  handler)
@@ -233,7 +477,7 @@ func installSignalHandlers() {
 
 installSignalHandlers()
 
-// MARK: - Step 6: Run
+// MARK: - Run
 
 print("✅ MouseRemap is running.")
 print("   Button 4 (Back)    → ⌘+[  (Command + Left Bracket)")
@@ -243,6 +487,4 @@ if gVerbose {
 }
 print("   Press Ctrl+C to stop.\n")
 
-// CFRunLoopRun() blocks forever, keeping the process alive and dispatching
-// HID events to our callback.
 CFRunLoopRun()
