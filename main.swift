@@ -25,7 +25,7 @@ let kKeyCodeRightBracket: CGKeyCode = 30   // ']'
 
 /// launchd service configuration.
 let kServiceLabel = "com.user.mouseremap"
-let kInstallPath  = "/usr/local/bin/MouseRemap"
+let kInstallPath  = (NSString("~/.local/bin/MouseRemap").expandingTildeInPath)
 let kPlistPath    = (NSString("~/Library/LaunchAgents/com.user.mouseremap.plist")
                         .expandingTildeInPath)
 
@@ -146,7 +146,7 @@ func performInstall() {
             try fm.createDirectory(atPath: installDir, withIntermediateDirectories: true)
         } catch {
             fputs("❌ Failed to create \(installDir): \(error.localizedDescription)\n", stderr)
-            fputs("\n💡 Try running with sudo:\n   sudo ./MouseRemap --install\n", stderr)
+            fputs("\n💡 Check directory permissions and try again.\n", stderr)
             exit(1)
         }
     }
@@ -159,7 +159,7 @@ func performInstall() {
         try fm.copyItem(atPath: binaryPath, toPath: kInstallPath)
     } catch {
         fputs("❌ Failed to copy binary: \(error.localizedDescription)\n", stderr)
-        fputs("\n💡 Try running with sudo:\n   sudo ./MouseRemap --install\n", stderr)
+        fputs("\n💡 Check directory permissions and try again.\n", stderr)
         exit(1)
     }
 
@@ -270,7 +270,7 @@ func performUninstall() {
             print("   ✅ Removed \(kInstallPath)")
         } catch {
             fputs("❌ Failed to remove binary: \(error.localizedDescription)\n", stderr)
-            fputs("💡 Try: sudo ./MouseRemap --uninstall\n", stderr)
+            fputs("💡 Check file permissions and try again.\n", stderr)
         }
     } else {
         print("   ⏭  Binary not found at \(kInstallPath), skipping")

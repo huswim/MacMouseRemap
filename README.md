@@ -51,16 +51,16 @@ permission. Without it the tool will print an error and exit.
 ### 자동 설치
 
 ```bash
-sudo ./MouseRemap --install
+./MouseRemap --install
 ```
 
-바이너리를 `/usr/local/bin/MouseRemap`에 복사하고, LaunchAgent plist를 생성한 뒤,
-`launchctl load`까지 자동으로 실행합니다.
+바이너리를 `~/.local/bin/MouseRemap`에 복사하고, LaunchAgent plist를 생성한 뒤,
+`launchctl load`까지 자동으로 실행합니다. sudo 권한이 필요 없습니다.
 
 ### 제거
 
 ```bash
-sudo ./MouseRemap --uninstall
+./MouseRemap --uninstall
 ```
 
 서비스 해제, plist 삭제, 바이너리 삭제를 모두 자동 처리합니다.
@@ -73,7 +73,7 @@ cat ~/Library/Logs/mouseremap.out.log      # 표준 출력 로그
 cat ~/Library/Logs/mouseremap.err.log      # 에러 로그
 ```
 
-> ⚠️ **중요:** Accessibility 권한은 `/usr/local/bin/MouseRemap` 바이너리에 직접
+> ⚠️ **중요:** Accessibility 권한은 `~/.local/bin/MouseRemap` 바이너리에 직접
 > 부여해야 합니다. 바이너리를 다시 빌드하여 복사한 경우 권한을 다시 부여해야 할 수
 > 있습니다.
 
