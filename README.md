@@ -1,5 +1,7 @@
 # MouseRemap
 
+> 🤖 이 프로젝트는 AI를 사용하여 생성되었습니다. (Google Antigravity + Claude Opus 4.6)
+
 A macOS command-line tool that remaps mouse side buttons to browser-style
 back/forward keyboard shortcuts — no third-party dependencies.
 
